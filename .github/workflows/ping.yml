@@ -1,0 +1,62 @@
+name: ping
+
+on:
+  schedule:
+    - cron: '7,17,27,37,47,57 * * * *' # off the hour: GitHub delays/drops top-of-hour runs
+  workflow_dispatch:
+    inputs:
+      simulate_down:
+        description: Pretend the targets are down (tests the alert path)
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency: ping
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: check
+        env:
+          TARGETS: ${{ secrets.TARGETS }}
+          HOOK: ${{ secrets.HOOK }}
+          WHO: ${{ secrets.WHO }}
+          SIMULATE_DOWN: ${{ inputs.simulate_down }}
+        run: |
+          up() {
+            [ "$SIMULATE_DOWN" = "true" ] && return 1
+            for t in $TARGETS; do curl -s -o /dev/null -f -m 15 "$t" && return 0; done
+            return 1
+          }
+          post() {
+            curl -s -f -o /dev/null -H 'Content-Type: application/json' \
+              -d "{\"content\":\"<@$WHO> $1\",\"allowed_mentions\":{\"users\":[\"$WHO\"]}}" "$HOOK"
+          }
+
+          # 3 tries over ~40s so one blip is not an outage
+          now=down
+          for i in 1 2 3; do up && { now=up; break; }; sleep 20; done
+          prev=$(cat state 2>/dev/null || echo up)
+          echo "status: $now (was $prev)"
+
+          git config user.name github-actions[bot]
+          git config user.email 41898299+github-actions[bot]@users.noreply.github.com
+
+          if [ "$now" != "$prev" ]; then
+            if [ "$now" = down ]; then
+              post "Uptime watch: the VPS is not answering (3 tries). Verification bot is offline. Check the VPS panel." || exit 1
+            else
+              post "Uptime watch: the VPS is answering again." || exit 1
+            fi
+            echo "$now" > state
+            git add state && git commit -qm "state: $now" && git push -q
+          elif [ $(( $(date +%s) - $(git log -1 --format=%ct) )) -gt $((25 * 86400)) ]; then
+            # GitHub disables schedules in public repos after 60 days without activity
+            git commit -q --allow-empty -m keepalive && git push -q
+          fi
