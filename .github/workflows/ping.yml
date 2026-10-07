@@ -29,33 +29,41 @@ jobs:
           WHO: ${{ secrets.WHO }}
           SIMULATE_DOWN: ${{ inputs.simulate_down }}
         run: |
-          up() {
-            [ "$SIMULATE_DOWN" = "true" ] && return 1
-            for t in $TARGETS; do curl -s -o /dev/null -f -m 15 "$t" && return 0; done
-            return 1
-          }
+          set +e  # grep misses and test-&& chains are expected here; explicit exits below
+          # TARGETS secret: one "name|url|expected_http_code" per line. Names only ever go to Discord, never to logs or the repo.
           post() {
-            curl -s -f -o /dev/null -H 'Content-Type: application/json' \
-              -d "{\"content\":\"<@$WHO> $1\",\"allowed_mentions\":{\"users\":[\"$WHO\"]}}" "$HOOK"
+            curl -s -f -o /dev/null -H 'Content-Type: application/json'               -d "{\"content\":\"<@$WHO> Uptime watch: $1\",\"allowed_mentions\":{\"users\":[\"$WHO\"]}}" "$HOOK"
+          }
+          code() {
+            [ "$SIMULATE_DOWN" = "true" ] && { echo 000; return; }
+            curl -s -o /dev/null -w '%{http_code}' -m 15 "$1"
           }
 
-          # 3 tries over ~40s so one blip is not an outage
-          now=down
-          for i in 1 2 3; do up && { now=up; break; }; sleep 20; done
-          prev=$(cat state 2>/dev/null || echo up)
-          echo "status: $now (was $prev)"
+          touch state
+          i=0; total=0; downs=0; msgs=""
+          while IFS='|' read -r name url want; do
+            [ -z "$url" ] && continue
+            i=$((i+1)); total=$((total+1))
+            # 3 tries over ~40s so one blip is not an outage
+            for t in 1 2 3; do got=$(code "$url"); [ "$got" = "$want" ] && break; [ $t -lt 3 ] && sleep 20; done
+            now=$([ "$got" = "$want" ] && echo up || echo down)
+            [ $now = down ] && downs=$((downs+1))
+            prev=$(grep "^$i=" state | cut -d= -f2); prev=${prev:-up}
+            if [ "$now" != "$prev" ]; then
+              [ $now = down ] && msgs="$msgs$name is DOWN (expected $want, got $got). " || msgs="${msgs}$name is back UP. "
+              sed -i "/^$i=/d" state; echo "$i=$now" >> state
+            fi
+          done <<< "$TARGETS"
+          echo "checked $total, down $downs"
 
           git config user.name github-actions[bot]
           git config user.email 41898299+github-actions[bot]@users.noreply.github.com
 
-          if [ "$now" != "$prev" ]; then
-            if [ "$now" = down ]; then
-              post "Uptime watch: the VPS is not answering (3 tries). Verification bot is offline. Check the VPS panel." || exit 1
-            else
-              post "Uptime watch: the VPS is answering again." || exit 1
-            fi
-            echo "$now" > state
-            git add state && git commit -qm "state: $now" && git push -q
+          if [ -n "$msgs" ]; then
+            [ $downs -eq $total ] && msgs="EVERYTHING is down, the VPS is probably off. $msgs"
+            post "$msgs" || exit 1
+            sort -o state state
+            git add state && git commit -qm "state change" && git push -q
           elif [ $(( $(date +%s) - $(git log -1 --format=%ct) )) -gt $((25 * 86400)) ]; then
             # GitHub disables schedules in public repos after 60 days without activity
             git commit -q --allow-empty -m keepalive && git push -q
